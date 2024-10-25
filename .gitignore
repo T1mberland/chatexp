@@ -1,0 +1,5 @@
+.stack-work/
+*~
+src/*.html
+src/*.json
+memo.txt
