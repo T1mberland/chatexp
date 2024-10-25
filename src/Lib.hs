@@ -15,9 +15,19 @@ import Safe
 import System.Environment (getArgs)
 import Text.HTML.Scalpel
 
+data Speech
+  = Speech (T.Text, T.Text) -- (Speaker, Content)
+  | NullSpeech
+  deriving (Show)
+
+data ConversationTree
+  = ConversationBranch Speech [ConversationTree]
+  | ConversationEnd
+  deriving (Show)
+
 data Conversation = Conversation
   { conversationTitle :: T.Text,
-    conversationContent :: [(T.Text, T.Text)] -- [(Speaker, Content)]
+    conversationContent :: ConversationTree
   }
   deriving (Show)
 
@@ -34,65 +44,6 @@ scrapeRawJSON url = do
     extractJSON str = do
       (js, _) <- (T.unsnoc . T.strip . T.replace "=" "" . T.replace "window.__remixContext" "") str
       return js
-
--- Maybe monad version
-getConversation' :: B.ByteString -> Maybe Conversation
-getConversation' x = do
-  y <- decode x :: Maybe Object
-  (Object state) <- y !? "state"
-  (Object loaderData) <- state !? "loaderData"
-  (Object routes) <- loaderData !? "routes/share.$shareId.($action)"
-  (Object serverResp) <- routes !? "serverResponse"
-  (Object dat) <- serverResp !? "data"
-
-  (String title) <- dat !? "title"
-  (Object mapping) <- dat !? "mapping"
-
-  parentKey <- fst <$> (headMay . filter (isParentObject . snd) . toAscList) mapping
-  convContent <- conversationStartingFrom parentKey mapping
-  return $ Conversation title convContent
-  where
-    -- Returns True if and only if it does not have a parent object.
-    isParentObject :: Value -> Bool
-    isParentObject (Object y) =
-      fromMaybe True $ do
-        _ <- y !? "parent"
-        return False
-    isParentObject _ = False
-
-    hasContent :: Object -> Bool
-    hasContent y = fromMaybe False $ do
-      _ <- y !? "parent"
-      return True
-
-    conversationStartingFrom :: Key -> Object -> Maybe [(T.Text, T.Text)]
-    conversationStartingFrom key mapping = do
-      (Object speech) <- mapping !? key
-      (Array children) <- speech !? "children"
-      if hasContent speech
-        then do
-          (Object message) <- speech !? "message"
-
-          (Object author) <- message !? "author"
-          (String role) <- author !? "role"
-
-          (Object content) <- message !? "content"
-          (Array parts) <- content !? "parts"
-
-          (String say) <- parts V.!? 0
-
-          if V.null children
-            then return [(role, say)]
-            else do
-              (String firstChild) <- children V.!? 0
-              next <- conversationStartingFrom (fromText firstChild) mapping
-              return ((role, say) : next)
-        else
-          if V.null children
-            then return []
-            else do
-              (String firstChild) <- children V.!? 0
-              conversationStartingFrom (fromText firstChild) mapping
 
 getConversation :: B.ByteString -> Either String Conversation
 getConversation x = do
@@ -145,10 +96,9 @@ getConversation x = do
 
     -- Returns True if and only if it does not have a parent object.
     isParentObject :: Value -> Bool
-    isParentObject (Object y) =
-      fromMaybe True $ do
-        _ <- y !? "parent"
-        return False
+    isParentObject (Object y) = fromMaybe True $ do
+      _ <- y !? "parent"
+      return False
     isParentObject _ = False
 
     -- Returns True if and only if it has any message conent
@@ -157,7 +107,7 @@ getConversation x = do
       _ <- y !? "message"
       return True
 
-    conversationStartingFrom :: Key -> Object -> Either String [(T.Text, T.Text)]
+    conversationStartingFrom :: Key -> Object -> Either String ConversationTree
     conversationStartingFrom key mapping = do
       speech <- toObject' =<< mapping ? key
       children <- toArray' =<< speech ? "children"
@@ -173,26 +123,57 @@ getConversation x = do
           say <- toString' =<< maybeToEither "`parts` is empty." (parts V.!? 0)
 
           if V.null children
-            then return [(role, say)]
+            then return $ ConversationBranch (Speech (role, say)) [ConversationEnd]
             else do
-              firstChild <- toString' =<< maybeToEither "Err(0): This error should not happen!" (children V.!? 0)
-              next <- conversationStartingFrom (fromText firstChild) mapping
-              return ((role, say) : next)
+              processedChildren <-
+                sequence $
+                  V.toList $
+                    V.map
+                      ( \k' -> do
+                          k <- toString' k'
+                          conversationStartingFrom (fromText k) mapping
+                      )
+                      children
+              return $ ConversationBranch (Speech (role, say)) processedChildren
         else
           if V.null children
-            then return []
+            then return ConversationEnd
             else do
-              firstChild <- toString' =<< maybeToEither "Err(1): This error should not happen!" (children V.!? 0)
-              conversationStartingFrom (fromText firstChild) mapping
+              processedChildren <-
+                sequence $
+                  V.toList $
+                    V.map
+                      ( \k' -> do
+                          k <- toString' k'
+                          conversationStartingFrom (fromText k) mapping
+                      )
+                      children
+              return $ ConversationBranch NullSpeech processedChildren
+
+-- Todo: Print all the branches
+printConversation :: Conversation -> IO ()
+printConversation (Conversation title content) = do
+  putStrLn $ "<!-- " ++ T.unpack title ++ " -->"
+  printSpeech content
+  where
+    printSpeech ConversationEnd = return ()
+    printSpeech (ConversationBranch (Speech (speaker, say)) (y : ys)) = do
+      putStr $ "**" ++ T.unpack speaker ++ ":** "
+      putStrLn $ T.unpack say ++ "\n"
+      printSpeech y
+    printSpeech (ConversationBranch NullSpeech (y : ys)) = printSpeech y
+    printSpeech _ = return ()
 
 someFunc :: IO ()
 someFunc = do
   argv <- getArgs
   if null argv
     then
-      putStrLn "The first argument must be an URL"
+      putStrLn "The first argument must be a URL"
     else do
       test <- scrapeRawJSON $ head argv
       case test of
-        Just x -> print $ getConversation $ convertString x
+        Just x -> case getConversation $ convertString x of
+          Left err -> putStrLn $ "Err: " ++ err
+          Right conv -> printConversation conv
         Nothing -> putStrLn "failed"
