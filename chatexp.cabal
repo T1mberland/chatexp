@@ -25,7 +25,12 @@ source-repository head
 
 library
   exposed-modules:
+      BranchLogic
+      ConversationParser
       Lib
+      Output
+      Scraper
+      Types
   other-modules:
       Paths_chatexp
   autogen-modules:
